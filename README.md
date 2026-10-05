@@ -74,6 +74,73 @@ docker compose down -v       # 停止并删除数据卷
 跨区关系、自环、重复关系与有向环在录入时仍按原规则拒绝（409），
 所有成功提交与拒绝事件照常写入版本与日志。
 
+## 删边后旧推断残留的复核步骤
+
+删除一条关系时，只有当该对对象之间**再无其他类型关系**时时间边才
+真正消失；引擎按删边前的真实祖先/后代闭包精确失效缓存，因此无论
+祖先侧还是后代侧的缓存在删前是否建立过（包括服务重启、回滚后缓存
+为空，或此前只查过某一侧），删边后的可达性、可互换组、本区层位都
+与当前关系一致；随后重新加边也按新图计算，不会复活旧可达关系。
+
+下面用一个独立发掘区 T9 做端到端复核（先 `docker compose up -d --build`，
+访问 <http://localhost:8000>）：
+
+```bash
+BASE=http://localhost:8000
+# 1) 建区与对象 x、y、u、v
+A=$(curl -s -XPOST $BASE/api/areas -H 'Content-Type: application/json' \
+      -d '{"code":"T9","name":"删边复核区"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+mk() { curl -s -XPOST $BASE/api/units -H 'Content-Type: application/json' \
+      -d "{\"area_id\":$A,\"code\":\"$1\",\"kind\":\"layer\"}" \
+      | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])'; }
+X=$(mk X); Y=$(mk Y); U=$(mk U); V=$(mk V)
+# 2) 录入 x→u、y→u、u→v
+add() { curl -s -XPOST $BASE/api/relations -H 'Content-Type: application/json' \
+      -d "{\"type\":\"earlier\",\"subject\":$1,\"object\":$2}"; }
+add $X $U >/dev/null; add $Y $U >/dev/null
+RUV=$(add $U $V | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+# 3) 删除 u→v
+curl -s -XDELETE $BASE/api/relations/$RUV > /tmp/del.json
+python3 - <<'EOF'
+import json
+d = json.load(open('/tmp/del.json'))
+codes = {n['id']: n['code'] for n in d['nodes']}
+aff = {codes[i] for i in d['affected']}
+assert {'X','Y','U','V'} <= aff, aff                 # 受影响对象含全部四者
+groups = [{codes[m] for m in g['members']} for g in d['groups']]
+assert {'X','Y'} in groups, groups                    # x、y 归为同组
+lay = {n['code']: (n['earliest'], n['latest']) for n in d['nodes']
+       if n['code'] in ('X','Y','U','V')}
+assert lay == {'X': (0,0), 'Y': (0,0), 'U': (1,1), 'V': (0,0)}, lay
+print('删除 u→v 后：affected=%s；可互换组含 {X,Y}；层位 %s' % (sorted(aff), lay))
+EOF
+# 4) x 不再可达 v，但仍可达 u
+curl -s "$BASE/api/basis?from=$X&to=$V" | grep -o '"reachable": false'
+curl -s "$BASE/api/basis?from=$X&to=$U" | grep -o '"reachable": true'
+# 5) 重新录入 u→v：x→v 按新图重新成立；再删后仍不成立
+NEW=$(add $U $V | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+curl -s "$BASE/api/basis?from=$X&to=$V" | grep -o '"reachable": true'
+curl -s -XDELETE $BASE/api/relations/$NEW >/dev/null
+curl -s "$BASE/api/basis?from=$X&to=$V" | grep -o '"reachable": false'
+```
+
+同一对对象若还有另一种类型关系，删除其中一条不改变时间边：在 u、v
+上再录一条“V 填充 U”（时间方向同为 u→v）后删掉“U 早于 V”，
+`affected` 为空、`u→v` 仍可达；再删掉填充关系，时间边才消失。
+
+接口契约保持不变：`DELETE /api/relations/<id>` 成功仍返回 **200**，
+响应仍是 `{"ok": true, ...全量 state}`（含 `affected` 节点 id 列表），
+不存在的 id 返回 **404**；每次成功删除仍写入一条新版本与事件日志。
+
+引擎层面的缓存一致性可用零依赖的差分测试复核（覆盖“只建过祖先侧 /
+只建过后代侧 / 两侧都建过 / 重启后缓存为空”四种删边前状态、多类型
+并行关系，以及 180 轮多区随机增删与“从零全量重算”参照结果的逐条
+比对）：
+
+```bash
+python3 tests/test_graph_cache.py
+```
+
 ## 不使用 Docker 的本地运行
 
 ```bash
@@ -141,13 +208,19 @@ curl -sX POST localhost:8000/api/relations \
 ## 实现要点
 
 - `app/engine/graph.py`：偏序图引擎。邻接表 + 反向邻接表；
-  祖先/后代闭包记忆化 DFS；加边时以 `Anc(u) × Desc(v)` 精确合并闭包，
-  删边时只失效可能变短的缓存条目；**层位（最长链）按发掘区分别缓存**：
+  祖先/后代闭包记忆化 DFS；加边时先在旧图上强制展开
+  `Anc(u) × Desc(v)` 锚点闭包再精确合并（缓存未建立不等于闭包只有
+  自身——重载后首次操作或上次删边只失效过一侧时，另一批闭包可能
+  缺失），删边时在**删边前**取两个锚点的真实闭包，时间边真正消失
+  （该对对象已无任何类型关系）才按真实闭包精确失效缓存条目，
+  缓存缺失按 `{自身}` 兜底会漏掉 x、y 一类间接祖先，正是“删边后
+  仍沿用旧可达推断”的根因；**层位（最长链）按发掘区分别缓存**：
   每区维护独立高度，增删边只失效所在区的 `earliest/latest/tail/高度`，
   其他区的推断缓存原样保留；可互换组的等价键包含 `area_id`，
   跨区对象不成组。环检测使用 BFS 求“晚端 → 早端”的最短路径，
-  即为最短矛盾链。引擎附带 1000 组随机差分测试验证增量结果与
-  全量重建一致（多区增删关系/对象）。
+  即为最短矛盾链。`tests/test_graph_cache.py` 以零依赖的回归断言与
+  180 轮多区随机差分测试（任意缓存预热、随机重载、加边/删边/删对象，
+  与全量重建参照逐条比对闭包、层位、可互换组及别区不受影响）。
 - `app/storage.py`：SQLite 建表与 CRUD（`areas / units / relations /
   versions / events`），版本保存完整 JSON 快照。
 - `app/app.py`：Flask 路由、校验顺序（存在性 → 自环 → 跨区 → 重复 →
@@ -162,13 +235,15 @@ curl -sX POST localhost:8000/api/relations \
 ├── docker-compose.yaml
 ├── requirements.txt
 ├── README.md
-└── app
-    ├── app.py              # Flask 路由与业务编排
-    ├── storage.py          # SQLite 持久层
-    ├── engine/
-    │   └── graph.py        # 带关系类型的偏序图引擎（环检测/层位/增量）
-    └── static/
-        ├── index.html
-        ├── style.css
-        └── app.js          # 矩阵 + SVG 关系图 + 版本/日志
+├── app
+│   ├── app.py              # Flask 路由与业务编排
+│   ├── storage.py          # SQLite 持久层
+│   ├── engine/
+│   │   └── graph.py        # 带关系类型的偏序图引擎（环检测/层位/增量）
+│   └── static/
+│       ├── index.html
+│       ├── style.css
+│       └── app.js          # 矩阵 + SVG 关系图 + 版本/日志
+└── tests
+    └── test_graph_cache.py # 删边缓存一致性回归 + 多区随机差分测试
 ```

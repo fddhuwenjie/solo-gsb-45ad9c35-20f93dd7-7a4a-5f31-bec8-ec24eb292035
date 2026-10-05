@@ -150,8 +150,13 @@ class Poset:
 
         跨区关系在录入层即被拒绝，增删边只改变所在区的偏序，因此
         其他区的最早/最晚层位与高度缓存可以原样保留。
+
+        注意不能以“本区高度缓存是否建立”作为有没有层位缓存要清理的
+        判据：只查过 earliest/tail 时，节点级 ``_early/_tail`` 已经
+        建立而 ``_area_height`` 仍为空，按旧判据会漏失效，使加/删边后
+        返回过期层位。
         """
-        touched = {a for a in area_ids if a in self._area_height}
+        touched = {a for a in area_ids}
         for aid in touched:
             self._area_height.pop(aid, None)
         if touched:
@@ -286,35 +291,71 @@ class Poset:
         self._next_rel_id = max(self._next_rel_id, int(rel_id) + 1)
 
         existed_pair = bool(self.adj.get(early, {}).get(late))
-        self.rels[rel_id] = {"id": rel_id, "s": s, "o": o, "type": rtype}
-        self._put_rel_in_adj(rel_id)
 
         if existed_pair:
             # 时间边已存在（只是补充另一种关系类型），偏序结构不变
             affected = set()
+            self.rels[rel_id] = {"id": rel_id, "s": s, "o": o, "type": rtype}
+            self._put_rel_in_adj(rel_id)
         else:
-            affected = self._incremental_add_edge(early, late)
+            # 先在**旧图**上强制展开两个锚点的真闭包，再装边合并。
+            # 缓存条目可能尚未建立（引擎从库重载后首次操作，或上次删边
+            # 只失效了一侧条目）：缓存缺失不代表闭包只有自身，直接按
+            # {x}/{y} 兜底合并会丢掉既有的间接可达关系。强制展开会把
+            # 沿途所有节点的旧闭包补齐为当前图上的正确值。
+            anc_e = self._force_anc(early)
+            desc_l = self._force_desc(late)
+            for x in anc_e:
+                self._force_desc(x)
+            for y in desc_l:
+                self._force_anc(y)
+
+            self.rels[rel_id] = {"id": rel_id, "s": s, "o": o, "type": rtype}
+            self._put_rel_in_adj(rel_id)
+            affected = self._incremental_add_edge(early, late,
+                                                  anc_e, desc_l)
         return rel_id, affected
 
-    def _incremental_add_edge(self, early, late):
-        """加一条新的时间边后的增量缓存合并。
+    def _force_desc(self, node):
+        """在当前邻接表上重算后代闭包（忽略锚点自身可能过期的缓存）。
+
+        递归中子节点优先用缓存：增删边维护的不变式是“现存缓存条目对
+        当前图全部正确”，因此能命中的缓存可安全复用，未命中的条目沿
+        当前邻接表展开并就地建立记忆。
+        """
+        acc = {node}
+        for nxt in self.adj.get(node, {}):
+            cached = self._desc.get(nxt)
+            acc |= cached if cached is not None else self._force_desc(nxt)
+        self._desc[node] = acc
+        return acc
+
+    def _force_anc(self, node):
+        """在当前反向邻接表上重算祖先闭包（忽略锚点自身可能过期的缓存）。"""
+        acc = {node}
+        for prv in self.rad.get(node, {}):
+            cached = self._anc.get(prv)
+            acc |= cached if cached is not None else self._force_anc(prv)
+        self._anc[node] = acc
+        return acc
+
+    def _incremental_add_edge(self, early, late, anc_e, desc_l):
+        """新时间边已装入邻接表后的增量缓存合并。
 
         新可达对恰为 ``Anc(early) × Desc(late)``：
         early 的每个祖先的后代集合并入 Desc(late)，
         late 的每个后代的祖先集合并入 Anc(early)。
-        两集合若有交叠，同一节点的两份缓存分别更新。
+        两侧锚点闭包及相关条目已在装边前于旧图上强制补齐，
+        这里读取的都是已建立的正确旧闭包。
         """
-        anc_e = self.ancestors(early)
-        desc_l = self.descendants(late)
-
         desc_updates = {}
         for x in anc_e:
-            desc_updates[x] = self._desc.get(x, {x}) | desc_l
+            desc_updates[x] = self._desc[x] | desc_l
         self._desc.update(desc_updates)
 
         anc_updates = {}
         for y in desc_l:
-            anc_updates[y] = self._anc.get(y, {y}) | anc_e
+            anc_updates[y] = self._anc[y] | anc_e
         self._anc.update(anc_updates)
 
         # 层位可能改变的节点恰为 Anc(early) ∪ Desc(late)：
@@ -333,36 +374,45 @@ class Poset:
         if r is None:
             return set()
         early, late = self.endpoints(r["type"], r["s"], r["o"])
+
+        # 时间边是否在删除后真正消失：先确认这对节点还有没有其他关系
+        pair_rels = [x for x in self.adj.get(early, {}).get(late, [])
+                     if x != rid]
+        edge_gone = not pair_rels
+
+        if edge_gone:
+            # 删边前先取两个锚点的**真闭包**：必须在邻接表仍含该边时
+            # 计算，且不能直接信懒加载缓存——引擎从库重载后可能只建立
+            # 了一侧闭包，缓存缺失并不意味着闭包只有自身（旧实现按
+            # ``{early}``/``{late}`` 兜底，会漏失效 x、y，使旧可达
+            # 关系残留）。
+            old_anc = set(self.ancestors(early))
+            old_desc = set(self.descendants(late))
+
         self._drop_rel_from_adj(rid)
         del self.rels[rid]
 
-        affected = set()
-        if not self.adj.get(early, {}).get(late):
-            # 该对节点间已无任何关系，时间边真正消失。
-            # 可达缓存可精确失效：仅 early 祖先们的后代集合、
-            # late 后代们的祖先集合可能“变短”。
-            A = set(self._anc.get(early, {early}))
-            D = set(self._desc.get(late, {late}))
-            for x in A:
+        if edge_gone:
+            # 含旧边的闭包条目恰为“early 祖先们的后代集合”与
+            # “late 后代们的祖先集合”，按删边前真闭包精确失效；
+            # 其余条目不经过旧边，保持原样。
+            for x in old_anc:
                 self._desc.pop(x, None)
-            for y in D:
+            for y in old_desc:
                 self._anc.pop(y, None)
-            # 受影响节点（前端用于“只重算高亮”）：
-            # 1) 可达性发生变化的节点（祖先侧/后代侧闭包）；
-            # 2) 最长出链可能回缩的节点——凡能到达 early 者，其 tail
-            #    都可能因 early 一侧变短而改变（即使其路径不经过 late，
-            #    例如 u→early 另有分支时）。
-            affected = set(A) | set(D)
-            for y in D:
-                affected |= self.ancestors(y)
-            for x in A:
-                affected |= self.descendants(x)
-            # 最长链回缩可能改变本区任意相关节点的层位，删边时传播面
-            # 难以精确界定：本区层位缓存整体失效、按需惰性重算；
+            # 受影响对象（前端用于“只重算高亮”）= 可达性可能变化的
+            # 全部节点：Anc_old(early) ∪ Desc_old(late)。
+            affected = old_anc | old_desc
+            # 层位（最长链）回缩可能改变本区相关节点的层位；删边时传播
+            # 面难以精确界定，本区层位缓存整体失效、按需惰性重算；
             # 其他发掘区的偏序未变，缓存与推断结果原样保留。
             self._invalidate_area_layers(
                 self.nodes[early].get("area_id"),
                 self.nodes[late].get("area_id"))
+        else:
+            # 该对节点仍有其他类型关系，时间边不变：可达性、层位与
+            # 可互换组都不受影响，无任何缓存需要失效。
+            affected = set()
         return affected
 
     # ------------------------------------------------------------------
