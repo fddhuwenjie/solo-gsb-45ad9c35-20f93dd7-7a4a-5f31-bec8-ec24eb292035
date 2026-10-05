@@ -7,7 +7,9 @@
 * 每个对象在所有约束下的最早层位（ASAP，最长前驱链）与最晚层位
   （ALAP，偏序高度减去最长后继链），二者相等意味着层位被完全锁定；
 * 可互换对象组（在偏序中位置等价：祖先集合与后代集合完全相同）；
-* 增量重算：加边/删边后只失效或合并受影响节点的缓存，其余节点复用。
+* 增量重算：加边/删边后只失效或合并受影响节点的缓存，其余节点复用；
+  失效集合按当前图现算（而非读缓存兜底），缓存未建立的一侧不会
+  残留旧推断。
 
 时间语义统一为 ``early -> late``（早者指向晚者）。三类考古关系的
 端点映射：
@@ -150,8 +152,12 @@ class Poset:
 
         跨区关系在录入层即被拒绝，增删边只改变所在区的偏序，因此
         其他区的最早/最晚层位与高度缓存可以原样保留。
+
+        不能按“该区高度是否已缓存”门控：``_early``/``_tail`` 可能在
+        高度尚未计算时就已建立（如直接查过 earliest，或作为别区
+        高度计算的副产品），门控会把这些过期条目漏掉。
         """
-        touched = {a for a in area_ids if a in self._area_height}
+        touched = set(area_ids)
         for aid in touched:
             self._area_height.pop(aid, None)
         if touched:
@@ -303,18 +309,27 @@ class Poset:
         early 的每个祖先的后代集合并入 Desc(late)，
         late 的每个后代的祖先集合并入 Anc(early)。
         两集合若有交叠，同一节点的两份缓存分别更新。
+
+        只合并**已缓存**的条目：闭包缓存可能只建了一侧甚至尚未建立，
+        缺失条目若按“仅含自身”兜底再合并，会丢掉该节点既有的可达
+        关系（缓存从此与图不一致）。缺失的条目保持缺失即可，下次
+        查询时沿新图惰性重建。
         """
         anc_e = self.ancestors(early)
         desc_l = self.descendants(late)
 
         desc_updates = {}
         for x in anc_e:
-            desc_updates[x] = self._desc.get(x, {x}) | desc_l
+            cached = self._desc.get(x)
+            if cached is not None:
+                desc_updates[x] = cached | desc_l
         self._desc.update(desc_updates)
 
         anc_updates = {}
         for y in desc_l:
-            anc_updates[y] = self._anc.get(y, {y}) | anc_e
+            cached = self._anc.get(y)
+            if cached is not None:
+                anc_updates[y] = cached | anc_e
         self._anc.update(anc_updates)
 
         # 层位可能改变的节点恰为 Anc(early) ∪ Desc(late)：
@@ -341,8 +356,16 @@ class Poset:
             # 该对节点间已无任何关系，时间边真正消失。
             # 可达缓存可精确失效：仅 early 祖先们的后代集合、
             # late 后代们的祖先集合可能“变短”。
-            A = set(self._anc.get(early, {early}))
-            D = set(self._desc.get(late, {late}))
+            # A/D 必须现算真实闭包，不能读缓存兜底：缓存可能只建立了
+            # 一侧（如只查过某些节点的后代、从未查祖先），按
+            # “仅含自身”兜底会漏掉真正的祖先/后代，使他们的旧闭包
+            # 缓存（含被删边才能到达的节点）残留下来。
+            # 在删边后的图上现算，得到的正是删边前的集合：到达 early
+            # 的简单路径不会先离开 early，从 late 出发的简单路径也不
+            # 会先进入 late，故删去 early->late 既不改变 early 的祖先，
+            # 也不改变 late 的后代。
+            A = set(self.ancestors(early))
+            D = set(self.descendants(late))
             for x in A:
                 self._desc.pop(x, None)
             for y in D:

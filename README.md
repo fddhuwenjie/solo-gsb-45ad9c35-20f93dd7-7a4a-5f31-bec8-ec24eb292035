@@ -74,6 +74,60 @@ docker compose down -v       # 停止并删除数据卷
 跨区关系、自环、重复关系与有向环在录入时仍按原规则拒绝（409），
 所有成功提交与拒绝事件照常写入版本与日志。
 
+## 删关系后推断一致性复核步骤
+
+删除关系后，引擎无论此前缓存建立了哪一侧（只查过某些节点的后代、
+从未查祖先，或反之），可达性、可互换组与本区层位都必须与当前关系
+一致。复核方式：
+
+0. **引擎自检**（覆盖“只建后代缓存 / 只建祖先缓存 / 无缓存 / 全缓存”
+   四种预热状态下的删边场景，以及 1000 组随机增删的差分对比）：
+
+   ```bash
+   python app/engine/test_graph.py        # 或：cd app && python -m unittest engine.test_graph -v
+   ```
+
+1. **构造场景**：新建复核区与同区对象 X/Y/U/V，录入
+   `X 早于 U`、`Y 早于 U`、`U 早于 V`：
+
+   ```bash
+   AID=$(curl -sX POST localhost:8000/api/areas -H 'Content-Type: application/json' \
+     -d '{"code":"T9","name":"删边复核"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+   mkuid() { curl -sX POST localhost:8000/api/units -H 'Content-Type: application/json' \
+     -d "{\"area_id\":$AID,\"code\":\"$1\",\"kind\":\"layer\"}" \
+     | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])'; }
+   X=$(mkuid X); Y=$(mkuid Y); U=$(mkuid U); V=$(mkuid V)
+   mkrel() { curl -sX POST localhost:8000/api/relations -H 'Content-Type: application/json' \
+     -d "{\"type\":\"earlier\",\"subject\":$1,\"object\":$2}" \
+     | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])'; }
+   R1=$(mkrel $X $U); R2=$(mkrel $Y $U); R3=$(mkrel $U $V)
+   ```
+
+2. **删除 `U→V` 并核对响应**：`DELETE /api/relations/<id>` 返回
+   **200** 与 `{"ok": true, ...}`（响应格式不变），`affected`
+   必须包含 X、Y、U、V 四个对象 id：
+
+   ```bash
+   curl -sX DELETE localhost:8000/api/relations/$R3 | python3 -m json.tool
+   ```
+
+3. **核对推断与当前关系一致**（`GET /api/state` 或页面）：
+   - X 的后代只剩 X、U（矩阵中 X→V 的间接底纹消失，V 不再是 X 的后代）；
+   - 可互换组出现 **X · Y**（二者前驱/后继集合相同）；
+   - 本区高度由 2 降为 1，X/Y/U/V 的层位窗口同步回缩；
+   - “版本 / 日志”页新增一条 `删除关系 U 早于 V` 的版本记录
+     （`GET /api/versions` 可见）。
+
+4. **再加边不得复活旧可达**：重新录入 `U 早于 V` 后，X 的后代恢复为
+   X、U、V（与当前关系一致）；再次删除结果与步骤 3 相同。
+
+5. **同对多类型删一条不动时间边**：对同一对对象再录一种类型
+   （如 `fills`，subject=U、object=V），删除其中任意一条时响应的
+   `affected` 为空、矩阵中直达边保留，可达性与层位均不变。
+
+6. **别区推断不变**：另建一区并录入对象与关系，上述删除前后该区
+   所有对象的 `earliest/latest` 与本区高度保持不变。
+
 ## 不使用 Docker 的本地运行
 
 ```bash
@@ -141,13 +195,17 @@ curl -sX POST localhost:8000/api/relations \
 ## 实现要点
 
 - `app/engine/graph.py`：偏序图引擎。邻接表 + 反向邻接表；
-  祖先/后代闭包记忆化 DFS；加边时以 `Anc(u) × Desc(v)` 精确合并闭包，
-  删边时只失效可能变短的缓存条目；**层位（最长链）按发掘区分别缓存**：
+  祖先/后代闭包记忆化 DFS；加边时把 `Anc(early) × Desc(late)` 并入
+  **已缓存**的闭包条目（未缓存的保持缺失、随查询惰性重建，不按
+  “仅含自身”兜底）；删边时在删边后的图上**现算** `Anc(early)` /
+  `Desc(late)` 并精确失效对应条目——无论此前缓存建立了哪一侧，
+  都不会残留旧可达关系；**层位（最长链）按发掘区分别缓存**：
   每区维护独立高度，增删边只失效所在区的 `earliest/latest/tail/高度`，
   其他区的推断缓存原样保留；可互换组的等价键包含 `area_id`，
   跨区对象不成组。环检测使用 BFS 求“晚端 → 早端”的最短路径，
-  即为最短矛盾链。引擎附带 1000 组随机差分测试验证增量结果与
-  全量重建一致（多区增删关系/对象）。
+  即为最短矛盾链。引擎附带随机差分测试
+  （`app/engine/test_graph.py`，1000 组随机增删 + 四种缓存预热
+  场景），验证任意缓存状态下增量结果与全量重建一致。
 - `app/storage.py`：SQLite 建表与 CRUD（`areas / units / relations /
   versions / events`），版本保存完整 JSON 快照。
 - `app/app.py`：Flask 路由、校验顺序（存在性 → 自环 → 跨区 → 重复 →
@@ -166,7 +224,8 @@ curl -sX POST localhost:8000/api/relations \
     ├── app.py              # Flask 路由与业务编排
     ├── storage.py          # SQLite 持久层
     ├── engine/
-    │   └── graph.py        # 带关系类型的偏序图引擎（环检测/层位/增量）
+    │   ├── graph.py        # 带关系类型的偏序图引擎（环检测/层位/增量）
+    │   └── test_graph.py   # 引擎测试：删边缓存一致性 + 随机差分
     └── static/
         ├── index.html
         ├── style.css
